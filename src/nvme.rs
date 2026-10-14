@@ -5,6 +5,10 @@
 //!   - Identify Controller (CNS=0x01)
 //!   - Identify Namespace (CNS=0x00)
 //!   - Get Log Page — SMART/Health Information (Log ID=0x02)
+//!
+//! ⚠ ioctl request: `as libc::c_int` работает и на glibc, и на musl.
+//! Значение NVME_IOCTL_ADMIN_CMD (0xC0484E41) НЕ влезает в i32 как positive,
+//! поэтому приводим через `as i32` (с сохранением битового представления).
 
 #![allow(dead_code)]
 
@@ -18,6 +22,8 @@ use std::path::Path;
 // ============================================================
 
 /// ioctl код NVME_IOCTL_ADMIN_CMD: _IOWR('N', 0x41, struct nvme_admin_cmd)
+/// = 0xC0484E41 — битовое представление (unsigned).
+/// Для ioctl нужно signed i32 — приведение через `as libc::c_int` сохраняет биты.
 const NVME_IOCTL_ADMIN_CMD: u64 = 0xC0484E41;
 
 /// CNS — Controller or Namespace Structure
@@ -83,7 +89,15 @@ impl NvmeDevice {
         cmd.addr = buf.as_mut_ptr() as u64;
         cmd.data_len = buf.len() as u32;
 
-        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &cmd) };
+        // ⚠ ioctl request: `as libc::c_int` для совместимости glibc/musl.
+        // 0xC0484E41 как i32 = отрицательное число, но биты сохраняются.
+        let ret = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                NVME_IOCTL_ADMIN_CMD as libc::c_int,
+                &cmd,
+            )
+        };
         if ret < 0 {
             bail!(
                 "ioctl(NVME_IOCTL_ADMIN_CMD) на {:?}: {}",
@@ -160,10 +174,7 @@ impl NvmeController {
 
 pub fn parse_identify_controller(data: &[u8]) -> Result<NvmeController> {
     if data.len() < 4096 {
-        bail!(
-            "Identify Controller: data too short ({} < 4096)",
-            data.len()
-        );
+        bail!("Identify Controller: data too short ({} < 4096)", data.len());
     }
 
     let vid = u16::from_le_bytes([data[0], data[1]]);
@@ -226,7 +237,7 @@ pub fn parse_identify_namespace(data: &[u8], nsid: u32) -> Result<NvmeNamespace>
     // Word 26 (offset 104..108): LBA Format — Dword 26 в спецификации
     // Биты 23:16 = LBADS (log2 размера LBA)
     let lbaf_dw = u32::from_le_bytes([data[104], data[105], data[106], data[107]]);
-    // Clippy-fix: lbaf_dw уже u32, `as u32` избыточен
+    // lbaf_dw уже u32, `as u32` избыточен
     let lbads = (lbaf_dw >> 16) & 0xFF;
     // LBADS не может быть больше 31 — защита от мусора
     let lba_size = if lbads < 32 { 1u32 << lbads } else { 512 };
@@ -414,16 +425,12 @@ mod tests {
     #[test]
     fn test_parse_smart_log_valid() {
         let mut data = [0u8; 512];
-        data[0] = 0x00; // critical_warning
-        data[1] = 0x12;
-        data[2] = 0x01; // temperature = 0x0112 = 274 K → 1 °C
-        data[3] = 0x64; // available_spare = 100
-        data[4] = 0x0A; // spare_thresh = 10
-        data[5] = 0x05; // percent_used = 5
-                        // data_units_read = 1000
-        data[32] = 0xE8;
-        data[33] = 0x03;
-        // power_on_hours = 100
+        data[0] = 0x00;
+        data[1] = 0x12; data[2] = 0x01;
+        data[3] = 0x64;
+        data[4] = 0x0A;
+        data[5] = 0x05;
+        data[32] = 0xE8; data[33] = 0x03;
         data[128] = 0x64;
 
         let s = parse_smart_log(&data).unwrap();
@@ -456,7 +463,7 @@ mod tests {
             warning_temp_time: 0,
             critical_comp_time: 0,
         };
-        assert_eq!(s.temperature_celsius(), 27); // 300 - 273
+        assert_eq!(s.temperature_celsius(), 27);
         s.critical_warning = 0x04;
         assert!(!s.health_ok());
     }
