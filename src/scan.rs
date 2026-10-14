@@ -1,6 +1,15 @@
 //! Сканирование поверхности с O_DIRECT и классификацией блоков.
+//!
 //! Режим визуальной карты — как в DOS Victoria.
+//!
 //! Возвращает ClassCounts и метрики в main для печати через ui.
+//!
+//! Особенности:
+//!   - O_DIRECT для чтения без кэша (475 МБ/с на SATA SSD).
+//!   - Fallback на обычный read при EINVAL.
+//!   - Классификация по порогам (Victoria / MHDD / fast / strict).
+//!   - Лог CSV: offset_mb, elapsed_ms, class, io_status.
+//!   - Дополнительный лог `<log>.bad` — только плохие блоки.
 
 use crate::log::ScanLog;
 use crate::thresholds::{BlockClass, ClassCounts, Thresholds};
@@ -9,7 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,13 +49,33 @@ pub struct ScanConfig {
     pub show_map: bool,
 }
 
-/// Результат сканирования — для печати в ui::print_scan_summary.
+/// Результат сканирования.
 pub struct ScanResult {
     pub counts: ClassCounts,
     pub bytes_done: u64,
     pub elapsed: Duration,
     pub interrupted: bool,
     pub log_path: PathBuf,
+    /// Путь к логу с плохими блоками (только Bad/Red).
+    pub bad_log_path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl ScanResult {
+    /// Средняя скорость в МБ/с.
+    pub fn speed_mbps(&self) -> f64 {
+        self.bytes_done as f64 / 1_048_576.0 / self.elapsed.as_secs_f64().max(0.001)
+    }
+
+    /// Всего блоков.
+    pub fn total_blocks(&self) -> u64 {
+        self.counts.total()
+    }
+
+    /// Проблемных блоков (Red + Bad).
+    pub fn problem_blocks(&self) -> u64 {
+        self.counts.red + self.counts.bad
+    }
 }
 
 // ============================================================
@@ -123,11 +152,16 @@ pub fn run(cfg: ScanConfig) -> Result<ScanResult> {
         pb
     };
 
-    // 7. Лог
+    // 7. Основной лог
     let mut log = ScanLog::create(&cfg.log_path)
         .with_context(|| format!("Не удалось создать лог {:?}", cfg.log_path))?;
 
-    // 8. Буфер, выровненный на 4096 (O_DIRECT)
+    // 8. Дополнительный лог — только плохие блоки
+    let bad_log_path = bad_log_path(&cfg.log_path);
+    let mut bad_log = ScanLog::create(&bad_log_path)
+        .with_context(|| format!("Не удалось создать bad-лог {:?}", bad_log_path))?;
+
+    // 9. Буфер, выровненный на 4096 (O_DIRECT)
     let layout =
         std::alloc::Layout::from_size_align(block_sz, DIRECT_ALIGN).context("Невалидный Layout")?;
     let buf_ptr = unsafe { std::alloc::alloc(layout) };
@@ -142,7 +176,7 @@ pub fn run(cfg: ScanConfig) -> Result<ScanResult> {
     file.seek(SeekFrom::Start(start_off))
         .with_context(|| format!("seek({})", start_off))?;
 
-    // 9. Главный цикл
+    // 10. Главный цикл
     let mut counts = ClassCounts::default();
     let t_start = Instant::now();
     let mut bytes_done: u64 = 0;
@@ -184,7 +218,15 @@ pub fn run(cfg: ScanConfig) -> Result<ScanResult> {
         let class = cfg.thresholds.classify(dt.as_secs_f64() * 1000.0, !io_ok);
         counts.add(class);
 
-        log.write(off_mb, dt.as_secs_f64() * 1000.0, class.as_str(), io_ok)?;
+        let elapsed_ms = dt.as_secs_f64() * 1000.0;
+
+        // Основной лог — все блоки
+        log.write(off_mb, elapsed_ms, class.as_str(), io_ok)?;
+
+        // Дополнительный лог — только плохие
+        if class.is_problem() || !io_ok {
+            bad_log.write(off_mb, elapsed_ms, class.as_str(), io_ok)?;
+        }
 
         bytes_done += block_sz as u64;
 
@@ -230,7 +272,9 @@ pub fn run(cfg: ScanConfig) -> Result<ScanResult> {
     if !cfg.show_map {
         pb.finish_and_clear();
     }
+
     log.flush()?;
+    bad_log.flush()?;
 
     Ok(ScanResult {
         counts,
@@ -238,6 +282,7 @@ pub fn run(cfg: ScanConfig) -> Result<ScanResult> {
         elapsed: t_start.elapsed(),
         interrupted,
         log_path: cfg.log_path,
+        bad_log_path,
     })
 }
 
@@ -268,11 +313,19 @@ fn open_device(path: &PathBuf) -> Result<std::fs::File> {
 }
 
 /// O_DIRECT требует выравнивания на 4096.
-///
-/// Clippy-fix: `div_ceil` вместо `(size + align - 1) / align * align`.
-/// `div_ceil` для `usize` стабилен с Rust 1.73.
 fn align_direct(size: usize) -> usize {
     size.div_ceil(DIRECT_ALIGN) * DIRECT_ALIGN
+}
+
+/// Путь к логу с плохими блоками: `<log>.bad`.
+fn bad_log_path(log_path: &Path) -> PathBuf {
+    let mut p = log_path.to_path_buf();
+    let ext = p
+        .extension()
+        .map(|e| format!("{}.bad", e.to_string_lossy()))
+        .unwrap_or_else(|| "bad".to_string());
+    p.set_extension(ext);
+    p
 }
 
 // ============================================================
@@ -293,3 +346,78 @@ impl Drop for BufGuard {
 
 // Проверка на этапе компиляции
 const _: () = assert!(DIRECT_ALIGN % SECTOR_SIZE == 0);
+
+// ============================================================
+// Тесты
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_align_direct_1k() {
+        assert_eq!(align_direct(1024), 4096);
+    }
+
+    #[test]
+    fn test_align_direct_4k() {
+        assert_eq!(align_direct(4096), 4096);
+    }
+
+    #[test]
+    fn test_align_direct_5k() {
+        assert_eq!(align_direct(5120), 8192);
+    }
+
+    #[test]
+    fn test_align_direct_0() {
+        assert_eq!(align_direct(0), 0);
+    }
+
+    #[test]
+    fn test_bad_log_path_with_ext() {
+        let p = bad_log_path(Path::new("/tmp/scan.log"));
+        assert_eq!(p, PathBuf::from("/tmp/scan.log.bad"));
+    }
+
+    #[test]
+    fn test_bad_log_path_without_ext() {
+        let p = bad_log_path(Path::new("/tmp/scan"));
+        assert_eq!(p, PathBuf::from("/tmp/scan.bad"));
+    }
+
+    #[test]
+    fn test_bad_log_path_csv() {
+        let p = bad_log_path(Path::new("/tmp/scan.csv"));
+        assert_eq!(p, PathBuf::from("/tmp/scan.csv.bad"));
+    }
+
+    #[test]
+    fn test_scan_result_speed() {
+        let r = ScanResult {
+            counts: ClassCounts::default(),
+            bytes_done: 1_048_576_000,
+            elapsed: Duration::from_secs(2),
+            interrupted: false,
+            log_path: PathBuf::from("/tmp/x.log"),
+            bad_log_path: PathBuf::from("/tmp/x.log.bad"),
+        };
+        assert!((r.speed_mbps() - 500.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_scan_result_problem_blocks() {
+        let mut counts = ClassCounts::default();
+        counts.red = 5;
+        counts.bad = 3;
+        let r = ScanResult {
+            counts,
+            bytes_done: 0,
+            elapsed: Duration::from_secs(1),
+            interrupted: false,
+            log_path: PathBuf::from("/tmp/x.log"),
+            bad_log_path: PathBuf::from("/tmp/x.log.bad"),
+        };
+        assert_eq!(r.problem_blocks(), 8);
+    }
+}

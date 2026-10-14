@@ -1,0 +1,18 @@
+mini-victoria/
+├── Cargo.toml
+├── src/
+│   ├── main.rs
+│   ├── smart.rs
+│   ├── scan.rs
+│   ├── thresholds.rs
+│   ├── ui.rs
+│   ├── log.rs
+│   └── bin/
+│       └── init.rs          # опционально — свой init
+├── iso/
+│   ├── build_initramfs.sh
+│   ├── build_iso.sh
+│   ├── build_debian_iso.sh
+│   └── build_apkovl.sh
+└── target/
+    └── x86_64-unknown-linux-musl/release/mini-victoria

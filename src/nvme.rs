@@ -90,13 +90,7 @@ impl NvmeDevice {
         // ⚠ `as _` — компилятор сам определит тип request:
         //   - glibc: Ioctl = c_ulong
         //   - musl:  Ioctl = c_int
-        let ret = unsafe {
-            libc::ioctl(
-                self.file.as_raw_fd(),
-                NVME_IOCTL_ADMIN_CMD as _,
-                &cmd,
-            )
-        };
+        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), NVME_IOCTL_ADMIN_CMD as _, &cmd) };
         if ret < 0 {
             bail!(
                 "ioctl(NVME_IOCTL_ADMIN_CMD) на {:?}: {}",
@@ -173,7 +167,10 @@ impl NvmeController {
 
 pub fn parse_identify_controller(data: &[u8]) -> Result<NvmeController> {
     if data.len() < 4096 {
-        bail!("Identify Controller: data too short ({} < 4096)", data.len());
+        bail!(
+            "Identify Controller: data too short ({} < 4096)",
+            data.len()
+        );
     }
 
     let vid = u16::from_le_bytes([data[0], data[1]]);
@@ -425,11 +422,13 @@ mod tests {
     fn test_parse_smart_log_valid() {
         let mut data = [0u8; 512];
         data[0] = 0x00;
-        data[1] = 0x12; data[2] = 0x01;
+        data[1] = 0x12;
+        data[2] = 0x01;
         data[3] = 0x64;
         data[4] = 0x0A;
         data[5] = 0x05;
-        data[32] = 0xE8; data[33] = 0x03;
+        data[32] = 0xE8;
+        data[33] = 0x03;
         data[128] = 0x64;
 
         let s = parse_smart_log(&data).unwrap();

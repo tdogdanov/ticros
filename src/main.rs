@@ -5,6 +5,7 @@ mod log;
 mod nvme;
 mod remap;
 mod scan;
+mod scsi;
 mod smart;
 mod thresholds;
 mod ui;
@@ -45,7 +46,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Информация о диске (IDENTIFY DEVICE / Identify Controller)
+    /// Информация о диске (IDENTIFY DEVICE / Identify Controller / SCSI INQUIRY)
     Info,
 
     /// Читать S.M.A.R.T.
@@ -92,10 +93,16 @@ enum Cmd {
         log: PathBuf,
         #[arg(long)]
         yes: bool,
+        /// Показать, что будет сделано, без выполнения
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Список доступных пресетов порогов
     Presets,
+
+    /// Список всех дисков в системе
+    ListDevices,
 }
 
 // ============================================================
@@ -116,9 +123,16 @@ fn run() -> Result<()> {
         std::env::set_var("NO_COLOR", "1");
     }
 
-    if matches!(cli.cmd, Cmd::Presets) {
-        print_presets();
-        return Ok(());
+    // Команды, не требующие --device и root
+    match cli.cmd {
+        Cmd::Presets => {
+            print_presets();
+            return Ok(());
+        }
+        Cmd::ListDevices => {
+            return cmd_list_devices();
+        }
+        _ => {}
     }
 
     let dev = cli
@@ -161,8 +175,8 @@ fn run() -> Result<()> {
             report,
         ),
         Cmd::Remap { lba, count, yes } => cmd_remap(dev, lba, count, yes),
-        Cmd::RemapLog { log, yes } => cmd_remap_log(dev, &log, yes),
-        Cmd::Presets => unreachable!(),
+        Cmd::RemapLog { log, yes, dry_run } => cmd_remap_log(dev, &log, yes, dry_run),
+        Cmd::Presets | Cmd::ListDevices => unreachable!(),
     }
 }
 
@@ -174,11 +188,61 @@ fn is_nvme(dev: &Path) -> bool {
     dev.to_string_lossy().contains("nvme")
 }
 
+fn is_usb(dev: &Path) -> bool {
+    scsi::is_usb_device(dev)
+}
+
+// ============================================================
+// ListDevices
+// ============================================================
+
+fn cmd_list_devices() -> Result<()> {
+    use std::fs;
+    let dev_dir = Path::new("/dev");
+    if !dev_dir.exists() {
+        anyhow::bail!("/dev не существует");
+    }
+
+    let mut devices: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dev_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        let is_sd = name_str.starts_with("sd")
+            && name_str.len() == 3
+            && name_str.chars().last().unwrap().is_ascii_alphabetic();
+
+        let is_nvme_disk =
+            name_str.starts_with("nvme") && name_str.contains('n') && name_str.len() >= 7;
+
+        if is_sd || is_nvme_disk {
+            let path = entry.path();
+            let kind = if is_usb(&path) {
+                "usb"
+            } else if is_nvme_disk {
+                "nvme"
+            } else {
+                "sata"
+            };
+            devices.push(format!("{}  [{}]", path.display(), kind));
+        }
+    }
+
+    devices.sort();
+    ui::print_device_list(&devices);
+    Ok(())
+}
+
 // ============================================================
 // Info
 // ============================================================
 
 fn cmd_info(dev: &Path, report: Option<&Path>) -> Result<()> {
+    if is_usb(dev) {
+        ui::print_info("Обнаружен USB-мост, используем SCSI INQUIRY");
+        return cmd_info_scsi(dev, report);
+    }
     if is_nvme(dev) {
         cmd_info_nvme(dev, report)
     } else {
@@ -221,11 +285,33 @@ fn cmd_info_nvme(dev: &Path, report: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_info_scsi(dev: &Path, report: Option<&Path>) -> Result<()> {
+    let scsi_dev = scsi::ScsiDevice::open(dev)
+        .with_context(|| format!("Не удалось открыть SCSI {:?}", dev))?;
+
+    let inq = scsi_dev.inquiry().context("SCSI INQUIRY failed")?;
+    let cap = scsi_dev
+        .read_capacity_10()
+        .or_else(|_| scsi_dev.read_capacity_16())
+        .context("READ CAPACITY (10/16) failed")?;
+
+    ui::print_scsi_info(&inq, &cap);
+
+    if let Some(path) = report {
+        ui::save_scsi_json(&inq, &cap, path)?;
+        ui::print_info(&format!("JSON-отчёт сохранён: {:?}", path));
+    }
+    Ok(())
+}
+
 // ============================================================
 // Smart
 // ============================================================
 
 fn cmd_smart(dev: &Path, full: bool, report: Option<&Path>) -> Result<()> {
+    if is_usb(dev) {
+        ui::print_info("USB-мост: пробуем smartctl (SG_IO ATA может не работать)");
+    }
     if is_nvme(dev) {
         cmd_smart_nvme(dev, full, report)
     } else {
@@ -311,6 +397,10 @@ fn cmd_scan(
         .validate()
         .map_err(|e| anyhow::anyhow!("Пороги невалидны: {}", e))?;
 
+    if is_usb(dev) {
+        ui::print_info("USB-мост: сканирование через pread (не SG_IO)");
+    }
+
     ui::print_info(&format!(
         "Пороги: fast={}ms good={}ms slow={}ms bad={}ms",
         thresholds.fast_ms, thresholds.good_ms, thresholds.slow_ms, thresholds.bad_ms
@@ -342,6 +432,7 @@ fn cmd_scan(
         result.bytes_done,
         result.elapsed,
         &result.log_path,
+        &result.bad_log_path,
         result.interrupted,
     );
 
@@ -368,6 +459,9 @@ fn cmd_remap(dev: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
     if is_nvme(dev) {
         anyhow::bail!("Remap не поддерживается для NVMe.");
     }
+    if is_usb(dev) {
+        anyhow::bail!("Remap не поддерживается для USB-мостов.");
+    }
     if !yes {
         ui::print_warn("Remap необратим! Добавьте --yes для подтверждения.");
         std::process::exit(1);
@@ -381,10 +475,18 @@ fn cmd_remap(dev: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_remap_log(dev: &Path, log: &Path, yes: bool) -> Result<()> {
+fn cmd_remap_log(dev: &Path, log: &Path, yes: bool, dry_run: bool) -> Result<()> {
     if is_nvme(dev) {
         anyhow::bail!("Remap не поддерживается для NVMe.");
     }
+    if is_usb(dev) {
+        anyhow::bail!("Remap не поддерживается для USB-мостов.");
+    }
+
+    if dry_run {
+        return remap::dry_run(dev, log);
+    }
+
     if !yes {
         ui::print_warn("Remap необратим! Добавьте --yes.");
         std::process::exit(1);

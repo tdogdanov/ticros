@@ -11,8 +11,10 @@
 //!   - Sector Count регистр — 16 бит, максимум 65535 секторов за команду.
 //!   - Для LBA > 2^28 нужен 48-bit режим (LBA48), иначе ABORTED COMMAND.
 //!   - На SSD spare area ограничена, remap может вернуть ILLEGAL REQUEST.
+//!   - USB-мосты не поддерживают REASSIGN_SECTORS.
 
 use crate::ata::{identify, AtaDevice, IdentifyInfo};
+use crate::scsi;
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
@@ -32,7 +34,7 @@ const REASSIGN_DELAY_MS: u64 = 50;
 const MAX_CHUNK: u32 = 1;
 
 // ============================================================
-// Публичная точка входа: remap одного диапазона
+// Remap одного диапазона
 // ============================================================
 
 /// Переназначить `count` секторов начиная с `lba`.
@@ -42,14 +44,19 @@ pub fn reassign(device: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
     // ─── 1. Подтверждение ──────────────────────────────────
     require_yes(yes)?;
 
+    // ─── 2. Проверка USB ───────────────────────────────────
+    if scsi::is_usb_device(device) {
+        bail!("Remap не поддерживается для USB-мостов (нет ATA PASS-THROUGH).");
+    }
+
     let count_u64 = if count == 0 { 1 } else { count as u64 };
 
-    // ─── 2. Паспорт диска — проверка границ ────────────────
+    // ─── 3. Паспорт диска — проверка границ ────────────────
     let info = identify_device_info(device)?;
     validate_range(&info, lba, count_u64)?;
     warn_if_ssd(&info);
 
-    // ─── 3. Открываем на запись ────────────────────────────
+    // ─── 4. Открываем на запись ────────────────────────────
     let dev =
         AtaDevice::open(device, true).context("Не удалось открыть диск на запись (нужен root)")?;
 
@@ -58,10 +65,10 @@ pub fn reassign(device: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
         device, info.model, lba, count_u64
     );
 
-    // ─── 4. Ctrl+C ─────────────────────────────────────────
+    // ─── 5. Ctrl+C ─────────────────────────────────────────
     let stop = install_ctrlc_handler();
 
-    // ─── 5. Прогресс-бар ───────────────────────────────────
+    // ─── 6. Прогресс-бар ───────────────────────────────────
     let pb = ProgressBar::new(count_u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -71,7 +78,7 @@ pub fn reassign(device: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
     );
     pb.set_message(format!("LBA={}", lba));
 
-    // ─── 6. Цикл remap ─────────────────────────────────────
+    // ─── 7. Цикл remap ─────────────────────────────────────
     let mut remaining = count_u64;
     let mut cur_lba = lba;
     let mut ok_count = 0u64;
@@ -107,7 +114,7 @@ pub fn reassign(device: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
 
     pb.finish_and_clear();
 
-    // ─── 7. SMART-статус после remap ───────────────────────
+    // ─── 8. SMART-статус после remap ───────────────────────
     match dev.smart_return_status() {
         Ok(true) => eprintln!("[+] SMART RETURN STATUS: OK"),
         Ok(false) => eprintln!("[!] SMART RETURN STATUS: FAILED"),
@@ -127,20 +134,73 @@ pub fn reassign(device: &Path, lba: u64, count: u32, yes: bool) -> Result<()> {
 }
 
 // ============================================================
+// Dry-run: показать, что будет сделано
+// ============================================================
+
+/// Показать, какие LBA будут переназначены, без выполнения.
+pub fn dry_run(device: &Path, log_path: &Path) -> Result<()> {
+    if scsi::is_usb_device(device) {
+        bail!("Remap не поддерживается для USB-мостов.");
+    }
+
+    let bad_lbas = parse_bad_lbas_from_log(log_path)?;
+    if bad_lbas.is_empty() {
+        eprintln!("[i] Плохих блоков не найдено в {:?}", log_path);
+        return Ok(());
+    }
+
+    let info = identify_device_info(device)?;
+    let max_lba = info.max_lba();
+
+    println!("\x1b[1m=== Dry-run: что будет переназначено ===\x1b[0m");
+    println!("  Устройство: {:?}", device);
+    println!("  Модель:     {}", info.model);
+    println!("  Всего LBA:  {}", bad_lbas.len());
+    println!();
+
+    let mut valid = 0u64;
+    let mut out_of_range = 0u64;
+
+    for (i, &lba) in bad_lbas.iter().take(20).enumerate() {
+        if lba >= max_lba {
+            println!("  {}. LBA {:>10}  [ВНЕ ДИАПАЗОНА]", i + 1, lba);
+            out_of_range += 1;
+        } else {
+            println!("  {}. LBA {:>10}  [OK]", i + 1, lba);
+            valid += 1;
+        }
+    }
+
+    if bad_lbas.len() > 20 {
+        println!("  ... ещё {} LBA", bad_lbas.len() - 20);
+    }
+
+    println!();
+    println!("  Валидных:        {}", valid);
+    println!("  Вне диапазона:   {}", out_of_range);
+    println!();
+    println!("  \x1b[93mЗапустить remap:\x1b[0m");
+    println!(
+        "  sudo ticros --device {:?} remap-log --log {:?} --yes",
+        device, log_path
+    );
+
+    Ok(())
+}
+
+// ============================================================
 // Remap из CSV-лога
 // ============================================================
 
 /// Remap всех плохих LBA из CSV-файла, сгенерированного `scan`.
-///
-/// Ожидаемый формат: `offset_mb,elapsed_ms,class,io_status`.
-/// Поддерживает: BOM в начале файла, пустые строки, `#`-комментарии,
-/// разделители `,`, `;`, таб.
 pub fn reassign_from_log(device: &Path, log_path: &Path, yes: bool) -> Result<()> {
     require_yes(yes)?;
 
-    // ─── 1. Парсим лог ─────────────────────────────────────
-    let bad_lbas = parse_bad_lbas_from_log(log_path)?;
+    if scsi::is_usb_device(device) {
+        bail!("Remap не поддерживается для USB-мостов.");
+    }
 
+    let bad_lbas = parse_bad_lbas_from_log(log_path)?;
     if bad_lbas.is_empty() {
         eprintln!("[i] Плохих блоков не найдено в {:?}", log_path);
         return Ok(());
@@ -152,19 +212,15 @@ pub fn reassign_from_log(device: &Path, log_path: &Path, yes: bool) -> Result<()
         log_path
     );
 
-    // ─── 2. Паспорт диска ──────────────────────────────────
     let info = identify_device_info(device)?;
     let max_lba = info.max_lba();
     warn_if_ssd(&info);
 
-    // ─── 3. Открываем на запись ────────────────────────────
     let dev =
         AtaDevice::open(device, true).context("Не удалось открыть диск на запись (нужен root)")?;
 
-    // ─── 4. Ctrl+C ─────────────────────────────────────────
     let stop = install_ctrlc_handler();
 
-    // ─── 5. Прогресс-бар ───────────────────────────────────
     let pb = ProgressBar::new(bad_lbas.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -173,7 +229,6 @@ pub fn reassign_from_log(device: &Path, log_path: &Path, yes: bool) -> Result<()
         .progress_chars("█▉▊▋▌▍▎▏  "),
     );
 
-    // ─── 6. Цикл remap ─────────────────────────────────────
     let t0 = Instant::now();
     let mut ok_count = 0u64;
     let mut err_count = 0u64;
@@ -230,7 +285,13 @@ pub fn reassign_from_log(device: &Path, log_path: &Path, yes: bool) -> Result<()
 // ============================================================
 
 /// Извлечь уникальные плохие LBA из CSV-лога сканирования.
-fn parse_bad_lbas_from_log(log_path: &Path) -> Result<Vec<u64>> {
+///
+/// Поддерживает:
+///   - BOM в начале файла
+///   - Пустые строки
+///   - `#`-комментарии
+///   - Разделители `,`, `;`, таб
+pub fn parse_bad_lbas_from_log(log_path: &Path) -> Result<Vec<u64>> {
     let raw =
         std::fs::read(log_path).with_context(|| format!("Не удалось прочитать {:?}", log_path))?;
 
@@ -250,8 +311,7 @@ fn parse_bad_lbas_from_log(log_path: &Path) -> Result<Vec<u64>> {
             continue;
         }
 
-        // Разделители: запятая, точка с запятой, таб.
-        // Clippy-fix: используем массив char вместо замыкания.
+        // Разделители: запятая, точка с запятой, таб
         let parts: Vec<&str> = line.split([',', ';', '\t']).map(|s| s.trim()).collect();
 
         if parts.len() < 4 {
@@ -271,7 +331,6 @@ fn parse_bad_lbas_from_log(log_path: &Path) -> Result<Vec<u64>> {
         }
 
         // offset_mb → LBA. 1 МБ = 2048 секторов по 512 байт.
-        // ⚠ Если у вас 4K-секторный диск — измените 2048 на 256.
         let lba = offset_mb.saturating_mul(2048);
         bad.push(lba);
     }
@@ -338,4 +397,160 @@ fn install_ctrlc_handler() -> Arc<AtomicBool> {
         let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst));
     }
     stop
+}
+
+// ============================================================
+// Тесты
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_log(name: &str, content: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("ticros_remap_{}_{}.log", name, std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        drop(f);
+        p
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_basic() {
+        let path = temp_log(
+            "basic",
+            "offset_mb,elapsed_ms,class,io_status\n\
+             0,0.5,Grey,OK\n\
+             10,45.0,Green,OK\n\
+             100,2000.0,Bad,OK\n\
+             200,150.0,Red,OK\n\
+             300,500.0,Yellow,OK\n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert_eq!(bad.len(), 2);
+        assert!(bad.contains(&(100 * 2048)));
+        assert!(bad.contains(&(200 * 2048)));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_io_error() {
+        let path = temp_log(
+            "io_err",
+            "offset_mb,elapsed_ms,class,io_status\n\
+             0,0.5,Grey,OK\n\
+             10,5000.0,Grey,ERR\n\
+             20,3.0,Green,OK\n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0], 10 * 2048);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_dedup() {
+        let path = temp_log(
+            "dedup",
+            "offset_mb,elapsed_ms,class,io_status\n\
+             100,2000.0,Bad,OK\n\
+             100,2000.0,Bad,OK\n\
+             100,2000.0,Bad,OK\n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert_eq!(bad.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_empty() {
+        let path = temp_log(
+            "empty",
+            "offset_mb,elapsed_ms,class,io_status\n\
+             0,0.5,Grey,OK\n\
+             10,3.0,Green,OK\n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert!(bad.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_comments() {
+        let path = temp_log(
+            "comments",
+            "offset_mb,elapsed_ms,class,io_status\n\
+             # comment line\n\
+             100,2000.0,Bad,OK\n\
+             \n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert_eq!(bad.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parse_bad_lbas_semicolon() {
+        let path = temp_log(
+            "semicolon",
+            "offset_mb;elapsed_ms;class;io_status\n\
+             100;2000.0;Bad;OK\n",
+        );
+
+        let bad = parse_bad_lbas_from_log(&path).unwrap();
+        assert_eq!(bad.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_validate_range_ok() {
+        let info = IdentifyInfo {
+            model: "T".into(),
+            serial: "S".into(),
+            firmware: "F".into(),
+            lba28_sectors: 0,
+            lba48_sectors: 1000,
+            rotation_rpm: None,
+            is_ssd: true,
+            smart_supported: true,
+            trim_supported: true,
+            form_factor: None,
+            interface: "SATA",
+            ncq_supported: true,
+        };
+        assert!(validate_range(&info, 100, 50).is_ok());
+    }
+
+    #[test]
+    fn test_validate_range_out_of_bounds() {
+        let info = IdentifyInfo {
+            model: "T".into(),
+            serial: "S".into(),
+            firmware: "F".into(),
+            lba28_sectors: 0,
+            lba48_sectors: 1000,
+            rotation_rpm: None,
+            is_ssd: true,
+            smart_supported: true,
+            trim_supported: true,
+            form_factor: None,
+            interface: "SATA",
+            ncq_supported: true,
+        };
+        assert!(validate_range(&info, 999, 10).is_err());
+        assert!(validate_range(&info, 2000, 1).is_err());
+    }
 }

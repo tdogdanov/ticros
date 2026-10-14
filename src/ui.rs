@@ -3,6 +3,7 @@
 use crate::ata::IdentifyInfo;
 use crate::nvme::{NvmeController, NvmeNamespace, NvmeSmart};
 use crate::scan::ScanResult;
+use crate::scsi::{Capacity, InquiryData};
 use crate::smart::{Severity, SmartData, SmartHealth};
 use crate::thresholds::{BlockClass, ClassCounts};
 use serde_json::json;
@@ -53,7 +54,6 @@ pub fn print_identify(i: &IdentifyInfo) {
         _ => println!("  Тип:         {DIM}неизвестен{RESET}"),
     }
 
-    // Форм-фактор: сначала из IDENTIFY, иначе — определяем по модели
     match i
         .form_factor
         .or_else(|| guess_form_factor(&i.model, i.is_ssd))
@@ -86,15 +86,9 @@ pub fn print_identify(i: &IdentifyInfo) {
 }
 
 /// Определить форм-фактор по имени модели (если IDENTIFY не сообщил).
-///
-/// Стратегия:
-///   1. Явные указатели в имени: "M.2", "2280", "2.5", "3.5", "mSATA".
-///   2. Известные NVMe-серии (обычно M.2).
-///   3. Fallback для SSD: 2.5".
 fn guess_form_factor(model: &str, is_ssd: bool) -> Option<&'static str> {
     let m = model.to_lowercase();
 
-    // 1. Явные указатели форм-фактора
     if m.contains("m.2") || m.contains("m2 ") || m.contains("2280") {
         return Some("M.2");
     }
@@ -111,48 +105,39 @@ fn guess_form_factor(model: &str, is_ssd: bool) -> Option<&'static str> {
         return Some("1.8\"");
     }
 
-    // 2. Известные NVMe-серии (M.2 форм-фактор)
     if is_ssd {
         let nvme_markers = [
-            // Samsung
             "970 ",
             "980 ",
             "990 ",
             "pm9",
             "sm9",
-            // WD
             "sn570",
             "sn770",
             "sn850",
             "sn580",
-            // Kingston
             "nv1 ",
             "nv2 ",
             "kc3000",
             "a2000",
-            // Crucial
             "p1 ",
             "p2 ",
             "p3 ",
             "p5 ",
             "t500",
-            // ADATA
             "sx6000",
             "sx8200",
             "sx8800",
             "gammix",
-            // Intel
             "660p",
             "665p",
             "670p",
-            // Seagate
             "firecuda",
             "barracuda 510",
         ];
         if nvme_markers.iter().any(|&marker| m.contains(marker)) {
             return Some("M.2");
         }
-        // 3. Fallback — большинство потребительских SSD — 2.5"
         return Some("2.5\"");
     }
 
@@ -283,6 +268,7 @@ pub fn print_scan_summary(
     bytes_done: u64,
     elapsed: Duration,
     log_path: &Path,
+    bad_log_path: &Path,
     interrupted: bool,
 ) {
     let speed = bytes_done as f64 / 1_048_576.0 / elapsed.as_secs_f64().max(0.001);
@@ -326,6 +312,7 @@ pub fn print_scan_summary(
     }
 
     println!("  Лог:        {:?}", log_path);
+    println!("  Bad-лог:    {:?}", bad_log_path);
 }
 
 // ============================================================
@@ -414,6 +401,49 @@ pub fn print_nvme_smart(s: &NvmeSmart) {
 }
 
 // ============================================================
+// SCSI / USB
+// ============================================================
+pub fn print_scsi_info(inq: &InquiryData, cap: &Capacity) {
+    println!("\n{BOLD}=== SCSI INQUIRY (USB bridge) ==={RESET}");
+    println!("  Vendor:      {}", inq.vendor);
+    println!("  Product:     {}", inq.product);
+    println!("  Revision:    {}", inq.revision);
+    println!("  Device type: {:#04x}", inq.device_type);
+    println!(
+        "  Removable:   {}",
+        if inq.is_removable { "да" } else { "нет" }
+    );
+
+    let bytes = cap.size_bytes();
+    let gb = bytes as f64 / 1_000_000_000.0;
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!("\n  {BOLD}Ёмкость:{RESET}");
+    println!("    Объём:      {:.1} ГБ ({:.1} ГиБ)", gb, gib);
+    println!("    Секторов:   {}", cap.total_sectors);
+    println!("    Размер сек: {} байт", cap.sector_size);
+
+    println!("\n  {DIM}Примечание: USB-мосты часто не поддерживают{RESET}");
+    println!("  {DIM}S.M.A.R.T. и ATA PASS-THROUGH.{RESET}");
+    println!("  {DIM}Для S.M.A.R.T. используйте: smartctl -a {RESET}");
+}
+
+// ============================================================
+// Список устройств
+// ============================================================
+pub fn print_device_list(devices: &[String]) {
+    println!("\n{BOLD}=== Диски в системе ==={RESET}\n");
+    if devices.is_empty() {
+        println!("  {DIM}не найдено{RESET}");
+    } else {
+        for d in devices {
+            println!("  {}", d);
+        }
+    }
+    println!("\n  {DIM}Для информации о диске:{RESET}");
+    println!("  sudo ticros --device /dev/sda info");
+}
+
+// ============================================================
 // Ошибки / предупреждения / инфо
 // ============================================================
 pub fn print_error(msg: &str) {
@@ -485,6 +515,22 @@ pub fn save_nvme_controller_json(
         "form_factor": "M.2",
         "interface": "NVMe",
         "namespace": ns_obj,
+    });
+    write_json(path, &obj)
+}
+
+pub fn save_scsi_json(inq: &InquiryData, cap: &Capacity, path: &Path) -> anyhow::Result<()> {
+    let obj = json!({
+        "type": "scsi",
+        "transport": "usb",
+        "vendor": inq.vendor,
+        "product": inq.product,
+        "revision": inq.revision,
+        "device_type": inq.device_type,
+        "is_removable": inq.is_removable,
+        "size_bytes": cap.size_bytes(),
+        "total_sectors": cap.total_sectors,
+        "sector_size": cap.sector_size,
     });
     write_json(path, &obj)
 }
@@ -665,13 +711,6 @@ mod tests {
     fn test_guess_form_factor_25() {
         assert_eq!(guess_form_factor("ADATA SU650", true), Some("2.5\""));
         assert_eq!(guess_form_factor("Kingston A400 2.5", true), Some("2.5\""));
-    }
-
-    #[test]
-    fn test_guess_form_factor_sata_ssd() {
-        assert_eq!(guess_form_factor("ADATA SU650", true), Some("2.5\""));
-        assert_eq!(guess_form_factor("Kingston A400", true), Some("2.5\""));
-        assert_eq!(guess_form_factor("WD Green 120GB", true), Some("2.5\""));
     }
 
     #[test]

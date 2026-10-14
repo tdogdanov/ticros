@@ -14,6 +14,9 @@
 //!
 //! ⚠ ioctl request: используем `as _` — компилятор сам подставит нужный
 //! тип (c_ulong на glibc, c_int на musl). Это единственный переносимый способ.
+//!
+//! ⚠ Для USB-мостов ATA PASS-THROUGH обычно не работает.
+//! См. модуль `scsi` — SCSI INQUIRY / READ CAPACITY / READ(10)/(16).
 
 #![allow(dead_code)]
 
@@ -25,12 +28,12 @@ use std::path::Path;
 // ============================================================
 // Константы SG_IO
 // ============================================================
-const SG_IO: u64 = 0x2285;
-const SG_DXFER_NONE: i32 = -1;
-const SG_DXFER_FROM_DEV: i32 = -3;
-const SG_DXFER_TO_DEV: i32 = -2;
+pub const SG_IO: u64 = 0x2285;
+pub const SG_DXFER_NONE: i32 = -1;
+pub const SG_DXFER_FROM_DEV: i32 = -3;
+pub const SG_DXFER_TO_DEV: i32 = -2;
 
-const SG_ALIGN: usize = 512;
+pub const SG_ALIGN: usize = 512;
 
 // ============================================================
 // ATA-команды
@@ -126,22 +129,36 @@ impl AtaDevice {
         let mut data_ptr: *mut libc::c_void = std::ptr::null_mut();
         let ret = unsafe { libc::posix_memalign(&mut data_ptr, SG_ALIGN, alloc_size) };
         if ret != 0 {
-            bail!("posix_memalign(data, {}, {}) = {}", SG_ALIGN, alloc_size, ret);
+            bail!(
+                "posix_memalign(data, {}, {}) = {}",
+                SG_ALIGN,
+                alloc_size,
+                ret
+            );
         }
-        unsafe { std::ptr::write_bytes(data_ptr as *mut u8, 0, alloc_size); }
+        unsafe {
+            std::ptr::write_bytes(data_ptr as *mut u8, 0, alloc_size);
+        }
 
         let mut sense_ptr: *mut libc::c_void = std::ptr::null_mut();
         let ret = unsafe { libc::posix_memalign(&mut sense_ptr, SG_ALIGN, 32) };
         if ret != 0 {
-            unsafe { libc::free(data_ptr); }
+            unsafe {
+                libc::free(data_ptr);
+            }
             bail!("posix_memalign(sense) = {}", ret);
         }
-        unsafe { std::ptr::write_bytes(sense_ptr as *mut u8, 0, 32); }
+        unsafe {
+            std::ptr::write_bytes(sense_ptr as *mut u8, 0, 32);
+        }
 
         let mut cdb_ptr: *mut libc::c_void = std::ptr::null_mut();
         let ret = unsafe { libc::posix_memalign(&mut cdb_ptr, SG_ALIGN, 16) };
         if ret != 0 {
-            unsafe { libc::free(data_ptr); libc::free(sense_ptr); }
+            unsafe {
+                libc::free(data_ptr);
+                libc::free(sense_ptr);
+            }
             bail!("posix_memalign(cdb) = {}", ret);
         }
         unsafe {
@@ -154,7 +171,11 @@ impl AtaDevice {
             cmd_len: 16,
             mx_sb_len: 32,
             dxfer_len: if buf_size == 0 { 0 } else { buf_size as u32 },
-            dxferp: if buf_size == 0 { std::ptr::null_mut() } else { data_ptr as *mut u8 },
+            dxferp: if buf_size == 0 {
+                std::ptr::null_mut()
+            } else {
+                data_ptr as *mut u8
+            },
             cmdp: cdb_ptr as *mut u8,
             sbp: sense_ptr as *mut u8,
             timeout: timeout_ms,
@@ -164,13 +185,7 @@ impl AtaDevice {
         // ⚠ `as _` — компилятор сам определит тип request:
         //   - glibc: Ioctl = c_ulong
         //   - musl:  Ioctl = c_int
-        let ret = unsafe {
-            libc::ioctl(
-                self.file.as_raw_fd(),
-                SG_IO as _,
-                &mut hdr,
-            )
-        };
+        let ret = unsafe { libc::ioctl(self.file.as_raw_fd(), SG_IO as _, &mut hdr) };
         let ioctl_err = if ret < 0 {
             Some(std::io::Error::last_os_error())
         } else {
@@ -182,8 +197,7 @@ impl AtaDevice {
                 bail!("ioctl(SG_IO): {}", e);
             }
             if hdr.status != 0 || hdr.host_status != 0 || hdr.driver_status != 0 {
-                let sense_slice =
-                    unsafe { std::slice::from_raw_parts(sense_ptr as *const u8, 32) };
+                let sense_slice = unsafe { std::slice::from_raw_parts(sense_ptr as *const u8, 32) };
                 bail!(
                     "SCSI error на {:?}: status={:#x} host={:#x} driver={:#x} resid={}\n{}",
                     self.path,
@@ -197,13 +211,13 @@ impl AtaDevice {
             if hdr.resid > 0 && buf_size > 0 {
                 bail!(
                     "SG_IO: непередано {} из {} байт (resid={})",
-                    hdr.resid, buf_size, hdr.resid
+                    hdr.resid,
+                    buf_size,
+                    hdr.resid
                 );
             }
             if buf_size > 0 {
-                Ok(unsafe {
-                    std::slice::from_raw_parts(data_ptr as *const u8, buf_size).to_vec()
-                })
+                Ok(unsafe { std::slice::from_raw_parts(data_ptr as *const u8, buf_size).to_vec() })
             } else {
                 Ok(Vec::new())
             }
@@ -298,7 +312,10 @@ impl AtaDevice {
             )
         };
         if ret < 0 {
-            bail!("ioctl(HDIO_GET_IDENTITY): {}", std::io::Error::last_os_error());
+            bail!(
+                "ioctl(HDIO_GET_IDENTITY): {}",
+                std::io::Error::last_os_error()
+            );
         }
         let word0 = u16::from_le_bytes([buf[0], buf[1]]);
         if word0 == 0 || word0 == 0xFFFF {
@@ -309,14 +326,32 @@ impl AtaDevice {
 
     pub fn smart_enable(&self) -> Result<()> {
         let smart_lba = ((SMART_CYL_HI as u64) << 8) | (SMART_CYL_LOW as u64);
-        let cdb = Self::make_cdb(ATA_SMART, SMART_ENABLE, 0, smart_lba, 0x40, PROTO_NON_DATA, false, TL_48);
+        let cdb = Self::make_cdb(
+            ATA_SMART,
+            SMART_ENABLE,
+            0,
+            smart_lba,
+            0x40,
+            PROTO_NON_DATA,
+            false,
+            TL_48,
+        );
         self.sg_io(&cdb, SG_DXFER_NONE, 0, 30_000)?;
         Ok(())
     }
 
     pub fn smart_read_data(&self) -> Result<[u8; 512]> {
         let smart_lba = ((SMART_CYL_HI as u64) << 8) | (SMART_CYL_LOW as u64);
-        let cdb = Self::make_cdb(ATA_SMART, SMART_READ_DATA, 1, smart_lba, 0x40, PROTO_PIO_IN, true, TL_48);
+        let cdb = Self::make_cdb(
+            ATA_SMART,
+            SMART_READ_DATA,
+            1,
+            smart_lba,
+            0x40,
+            PROTO_PIO_IN,
+            true,
+            TL_48,
+        );
         let out = self.sg_io(&cdb, SG_DXFER_FROM_DEV, 512, 30_000)?;
         let mut arr = [0u8; 512];
         arr.copy_from_slice(&out[..512]);
@@ -325,7 +360,16 @@ impl AtaDevice {
 
     pub fn smart_read_thresholds(&self) -> Result<[u8; 512]> {
         let smart_lba = ((SMART_CYL_HI as u64) << 8) | (SMART_CYL_LOW as u64);
-        let cdb = Self::make_cdb(ATA_SMART, SMART_READ_THRESH, 1, smart_lba, 0x40, PROTO_PIO_IN, true, TL_48);
+        let cdb = Self::make_cdb(
+            ATA_SMART,
+            SMART_READ_THRESH,
+            1,
+            smart_lba,
+            0x40,
+            PROTO_PIO_IN,
+            true,
+            TL_48,
+        );
         let out = self.sg_io(&cdb, SG_DXFER_FROM_DEV, 512, 30_000)?;
         let mut arr = [0u8; 512];
         arr.copy_from_slice(&out[..512]);
@@ -334,7 +378,16 @@ impl AtaDevice {
 
     pub fn smart_return_status(&self) -> Result<bool> {
         let smart_lba = ((SMART_CYL_HI as u64) << 8) | (SMART_CYL_LOW as u64);
-        let cdb = Self::make_cdb(ATA_SMART, SMART_RETURN_STATUS, 0, smart_lba, 0x40, PROTO_NON_DATA, false, TL_48);
+        let cdb = Self::make_cdb(
+            ATA_SMART,
+            SMART_RETURN_STATUS,
+            0,
+            smart_lba,
+            0x40,
+            PROTO_NON_DATA,
+            false,
+            TL_48,
+        );
         match self.sg_io(&cdb, SG_DXFER_NONE, 0, 30_000) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
@@ -342,7 +395,16 @@ impl AtaDevice {
     }
 
     pub fn reassign_sectors(&self, lba: u64, count: u16) -> Result<()> {
-        let cdb = Self::make_cdb(ATA_SET_FEATURES, FEATURE_REASSIGN_SECTORS, count, lba, 0x40, PROTO_NON_DATA, false, TL_48);
+        let cdb = Self::make_cdb(
+            ATA_SET_FEATURES,
+            FEATURE_REASSIGN_SECTORS,
+            count,
+            lba,
+            0x40,
+            PROTO_NON_DATA,
+            false,
+            TL_48,
+        );
         self.sg_io(&cdb, SG_DXFER_NONE, 0, 60_000)?;
         Ok(())
     }
@@ -351,14 +413,10 @@ impl AtaDevice {
 // ============================================================
 // Sense-парсер
 // ============================================================
-fn format_sense(sense: &[u8], len: usize) -> String {
+pub fn format_sense(sense: &[u8], len: usize) -> String {
     let len = len.min(sense.len());
     if len < 14 {
-        return format!(
-            "  sense_data={} (len={})",
-            hex::encode(&sense[..len]),
-            len
-        );
+        return format!("  sense_data={} (len={})", hex::encode(&sense[..len]), len);
     }
     let response = sense[0] & 0x7F;
     let key = sense[2] & 0x0F;
@@ -366,11 +424,21 @@ fn format_sense(sense: &[u8], len: usize) -> String {
     let ascq = sense[13];
 
     let key_str = match key {
-        0x0 => "NO SENSE", 0x1 => "RECOVERED ERROR", 0x2 => "NOT READY",
-        0x3 => "MEDIUM ERROR", 0x4 => "HARDWARE ERROR", 0x5 => "ILLEGAL REQUEST",
-        0x6 => "UNIT ATTENTION", 0x7 => "DATA PROTECT", 0x8 => "BLANK CHECK",
-        0x9 => "VENDOR SPECIFIC", 0xA => "COPY ABORTED", 0xB => "ABORTED COMMAND",
-        0xC => "EQUAL", 0xD => "VOLUME OVERFLOW", 0xE => "MISCOMPARE",
+        0x0 => "NO SENSE",
+        0x1 => "RECOVERED ERROR",
+        0x2 => "NOT READY",
+        0x3 => "MEDIUM ERROR",
+        0x4 => "HARDWARE ERROR",
+        0x5 => "ILLEGAL REQUEST",
+        0x6 => "UNIT ATTENTION",
+        0x7 => "DATA PROTECT",
+        0x8 => "BLANK CHECK",
+        0x9 => "VENDOR SPECIFIC",
+        0xA => "COPY ABORTED",
+        0xB => "ABORTED COMMAND",
+        0xC => "EQUAL",
+        0xD => "VOLUME OVERFLOW",
+        0xE => "MISCOMPARE",
         _ => "UNKNOWN",
     };
     let asc_str = match (asc, ascq) {
@@ -385,7 +453,12 @@ fn format_sense(sense: &[u8], len: usize) -> String {
     };
     format!(
         "  sense response={:#x}\n  sense_key={:#x} ({})\n  asc={:#x} ascq={:#x} ({})\n  raw={}",
-        response, key, key_str, asc, ascq, asc_str,
+        response,
+        key,
+        key_str,
+        asc,
+        ascq,
+        asc_str,
         hex::encode(&sense[..len])
     )
 }
@@ -411,13 +484,23 @@ pub struct IdentifyInfo {
 
 impl IdentifyInfo {
     pub fn max_lba(&self) -> u64 {
-        if self.lba48_sectors > 0 { self.lba48_sectors } else { self.lba28_sectors }
+        if self.lba48_sectors > 0 {
+            self.lba48_sectors
+        } else {
+            self.lba28_sectors
+        }
     }
-    pub fn size_bytes(&self) -> u64 { self.max_lba().saturating_mul(512) }
+    pub fn size_bytes(&self) -> u64 {
+        self.max_lba().saturating_mul(512)
+    }
     pub fn kind(&self) -> &'static str {
-        if self.is_ssd { "SSD" }
-        else if self.rotation_rpm.is_some() { "HDD" }
-        else { "Unknown" }
+        if self.is_ssd {
+            "SSD"
+        } else if self.rotation_rpm.is_some() {
+            "HDD"
+        } else {
+            "Unknown"
+        }
     }
 }
 
@@ -448,8 +531,7 @@ pub fn parse_identify(data: &[u8; 512]) -> Result<IdentifyInfo> {
     let lba28 = lba28_lo | (lba28_hi << 16);
 
     let lba48 = u64::from_le_bytes([
-        data[200], data[201], data[202], data[203],
-        data[204], data[205], data[206], data[207],
+        data[200], data[201], data[202], data[203], data[204], data[205], data[206], data[207],
     ]);
 
     let rotation = u16::from_le_bytes([data[434], data[435]]);
@@ -511,8 +593,7 @@ pub fn parse_identify_plain(data: &[u8; 512]) -> Result<IdentifyInfo> {
     let lba28 = u16::from_le_bytes([data[120], data[121]]) as u64;
 
     let lba48 = u64::from_le_bytes([
-        data[200], data[201], data[202], data[203],
-        data[204], data[205], data[206], data[207],
+        data[200], data[201], data[202], data[203], data[204], data[205], data[206], data[207],
     ]);
 
     let rotation = u16::from_le_bytes([data[434], data[435]]);
@@ -588,8 +669,12 @@ fn ata_string_swapped(bytes: &[u8]) -> String {
         if chunk.len() == 2 {
             let c0 = chunk[1];
             let c1 = chunk[0];
-            if c0 != 0 { s.push(c0 as char); }
-            if c1 != 0 { s.push(c1 as char); }
+            if c0 != 0 {
+                s.push(c0 as char);
+            }
+            if c1 != 0 {
+                s.push(c1 as char);
+            }
         }
     }
     s.trim().to_string()
@@ -598,7 +683,9 @@ fn ata_string_swapped(bytes: &[u8]) -> String {
 fn ata_string_plain(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len());
     for &b in bytes {
-        if b == 0 { continue; }
+        if b == 0 {
+            continue;
+        }
         if (0x20..0x7F).contains(&b) {
             s.push(b as char);
         }
@@ -616,9 +703,7 @@ mod tests {
     #[test]
     fn test_ata_string_swapped() {
         let bytes: Vec<u8> = vec![
-            b'D', b'A', b'T', b'A', b' ', b'A',
-            b'U', b'S', b'5', b'6', b'0', 0,
-            0, 0, 0, 0,
+            b'D', b'A', b'T', b'A', b' ', b'A', b'U', b'S', b'5', b'6', b'0', 0, 0, 0, 0, 0,
         ];
         assert_eq!(ata_string_swapped(&bytes), "ADATA SU650");
     }
@@ -626,9 +711,7 @@ mod tests {
     #[test]
     fn test_ata_string_swapped_trailing_spaces() {
         let bytes: Vec<u8> = vec![
-            b'D', b'A', b'T', b'A', b' ', b'A',
-            b'U', b'S', b'5', b'6', b'0', 0,
-            b' ', 0, b' ', 0,
+            b'D', b'A', b'T', b'A', b' ', b'A', b'U', b'S', b'5', b'6', b'0', 0, b' ', 0, b' ', 0,
         ];
         assert_eq!(ata_string_swapped(&bytes), "ADATA SU650");
     }
@@ -636,8 +719,8 @@ mod tests {
     #[test]
     fn test_ata_string_plain() {
         let bytes: Vec<u8> = vec![
-            b'A', b'D', b'A', b'T', b'A', b' ', b'S', b'U',
-            b'6', b'5', b'0', b' ', b' ', b' ', b' ', b' ',
+            b'A', b'D', b'A', b'T', b'A', b' ', b'S', b'U', b'6', b'5', b'0', b' ', b' ', b' ',
+            b' ', b' ',
         ];
         assert_eq!(ata_string_plain(&bytes), "ADATA SU650");
     }
@@ -678,26 +761,39 @@ mod tests {
     #[test]
     fn test_identify_info_max_lba() {
         let info = IdentifyInfo {
-            model: "T".into(), serial: "S".into(), firmware: "F".into(),
-            lba28_sectors: 1000, lba48_sectors: 2000,
-            rotation_rpm: None, is_ssd: true,
-            smart_supported: true, trim_supported: true,
+            model: "T".into(),
+            serial: "S".into(),
+            firmware: "F".into(),
+            lba28_sectors: 1000,
+            lba48_sectors: 2000,
+            rotation_rpm: None,
+            is_ssd: true,
+            smart_supported: true,
+            trim_supported: true,
             form_factor: Some("2.5\""),
             interface: "SATA",
             ncq_supported: true,
         };
         assert_eq!(info.max_lba(), 2000);
-        let info2 = IdentifyInfo { lba48_sectors: 0, ..info.clone() };
+        let info2 = IdentifyInfo {
+            lba48_sectors: 0,
+            ..info.clone()
+        };
         assert_eq!(info2.max_lba(), 1000);
     }
 
     #[test]
     fn test_identify_info_size_bytes() {
         let info = IdentifyInfo {
-            model: "T".into(), serial: "S".into(), firmware: "F".into(),
-            lba28_sectors: 0, lba48_sectors: 234441648,
-            rotation_rpm: None, is_ssd: true,
-            smart_supported: true, trim_supported: true,
+            model: "T".into(),
+            serial: "S".into(),
+            firmware: "F".into(),
+            lba28_sectors: 0,
+            lba48_sectors: 234441648,
+            rotation_rpm: None,
+            is_ssd: true,
+            smart_supported: true,
+            trim_supported: true,
             form_factor: Some("M.2"),
             interface: "SATA",
             ncq_supported: true,
