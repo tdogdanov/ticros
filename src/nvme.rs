@@ -6,9 +6,8 @@
 //!   - Identify Namespace (CNS=0x00)
 //!   - Get Log Page — SMART/Health Information (Log ID=0x02)
 //!
-//! ⚠ ioctl request: `as libc::c_int` работает и на glibc, и на musl.
-//! Значение NVME_IOCTL_ADMIN_CMD (0xC0484E41) НЕ влезает в i32 как positive,
-//! поэтому приводим через `as i32` (с сохранением битового представления).
+//! ⚠ ioctl request: используем `as _` — компилятор сам подставит нужный
+//! тип (c_ulong на glibc, c_int на musl). Это единственный переносимый способ.
 
 #![allow(dead_code)]
 
@@ -23,7 +22,6 @@ use std::path::Path;
 
 /// ioctl код NVME_IOCTL_ADMIN_CMD: _IOWR('N', 0x41, struct nvme_admin_cmd)
 /// = 0xC0484E41 — битовое представление (unsigned).
-/// Для ioctl нужно signed i32 — приведение через `as libc::c_int` сохраняет биты.
 const NVME_IOCTL_ADMIN_CMD: u64 = 0xC0484E41;
 
 /// CNS — Controller or Namespace Structure
@@ -89,12 +87,13 @@ impl NvmeDevice {
         cmd.addr = buf.as_mut_ptr() as u64;
         cmd.data_len = buf.len() as u32;
 
-        // ⚠ ioctl request: `as libc::c_int` для совместимости glibc/musl.
-        // 0xC0484E41 как i32 = отрицательное число, но биты сохраняются.
+        // ⚠ `as _` — компилятор сам определит тип request:
+        //   - glibc: Ioctl = c_ulong
+        //   - musl:  Ioctl = c_int
         let ret = unsafe {
             libc::ioctl(
                 self.file.as_raw_fd(),
-                NVME_IOCTL_ADMIN_CMD as libc::c_int,
+                NVME_IOCTL_ADMIN_CMD as _,
                 &cmd,
             )
         };

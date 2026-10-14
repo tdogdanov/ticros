@@ -12,8 +12,8 @@
 //! SATA-интерфейс определяется по word 76 (sata_cap):
 //! если поле != 0 — это SATA. cmd_set1 bit 15 для этого НЕ используется.
 //!
-//! ⚠ ioctl request: `as libc::c_int` работает и на glibc, и на musl.
-//! Значения SG_IO (0x2285) и HDIO_GET_IDENTITY (0x030D) влезают в i32.
+//! ⚠ ioctl request: используем `as _` — компилятор сам подставит нужный
+//! тип (c_ulong на glibc, c_int на musl). Это единственный переносимый способ.
 
 #![allow(dead_code)]
 
@@ -161,11 +161,13 @@ impl AtaDevice {
             ..Default::default()
         };
 
-        // ⚠ ioctl request: `as libc::c_int` для совместимости glibc/musl.
+        // ⚠ `as _` — компилятор сам определит тип request:
+        //   - glibc: Ioctl = c_ulong
+        //   - musl:  Ioctl = c_int
         let ret = unsafe {
             libc::ioctl(
                 self.file.as_raw_fd(),
-                SG_IO as libc::c_int,
+                SG_IO as _,
                 &mut hdr,
             )
         };
@@ -287,11 +289,11 @@ impl AtaDevice {
         const HDIO_GET_IDENTITY: u64 = 0x030d;
         let mut buf = [0u8; 512];
 
-        // ⚠ ioctl request: `as libc::c_int` для совместимости glibc/musl.
+        // ⚠ `as _` — компилятор сам определит тип request.
         let ret = unsafe {
             libc::ioctl(
                 self.file.as_raw_fd(),
-                HDIO_GET_IDENTITY as libc::c_int,
+                HDIO_GET_IDENTITY as _,
                 buf.as_mut_ptr(),
             )
         };
